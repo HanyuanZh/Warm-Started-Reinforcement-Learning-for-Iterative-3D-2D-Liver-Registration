@@ -32,16 +32,3 @@ The framework demonstrates how RL can be applied to medical image registration t
 
 The dataset used in this work originates from the **Liver Registration Evaluation dataset**, available at:  
 🔗 [https://encov.ip.uca.fr/ab/code_and_datasets/datasets/llr_reg_evaluation_by_lus/index.php](https://encov.ip.uca.fr/ab/code_and_datasets/datasets/llr_reg_evaluation_by_lus/index.php)
-
----
-
-## 🧩 Notes
-
-- This implementation is intended for **patient-specific training** and evaluation.  
-- The provided data and scripts use **patient 4** as an example case.
-
----
-
-## 🧑‍💻 Citation
-
-If you use this code or data in your research, please cite the dataset source and refer to this repository appropriately.
