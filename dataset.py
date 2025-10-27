@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from typing import Union, Optional
-from matrices_tranversion_tensor import vtk_2_PyTorch3D, surgvtk_2_vtk
+from matrices_tranversion_tensor1 import vtk_2_PyTorch3D, surgvtk_2_vtk
 from matrices_tranversion import PyTorch3d_2_surgvtk
 from matrices_tranversion_tensor1 import surgvtk_to_pytorch3d, pytorch3d_to_surgvtk, compose_in_pytorch3d
 
@@ -23,7 +23,7 @@ class PosePairDataset(Dataset):
     """
     def __init__(
         self,
-        pose_path: str = "./data/Bartoli/training_pose.npy",
+        pose_path: str = "./data/training_pose.npy",
         id_path: str = "./data/mat_id.npy",
         device: Union[str, torch.device] = "cuda",
         dtype: torch.dtype = torch.float32,
