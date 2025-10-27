@@ -1,0 +1,26 @@
+{
+  "surfaces": {
+    "liver": {
+      "file":  "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient3/Rigid_Prediction/data/Bartoli/upper_liver.vtk",
+      "colour": [
+        120,
+        120,
+        120
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    },
+    "bottom_liver": {
+      "file": "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient3/Rigid_Prediction/data/Bartoli/bottom_liver.vtk",
+      "colour": [
+        0,
+        0,
+        120
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    }
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "surfaces": {
+    "liver": {
+      "file":  "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient4/Rigid_Prediction/data/Bartoli/upper_liver_new1.vtk",
+      "colour": [
+        120,
+        120,
+        120
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    },
+    "right_ridge": {
+      "file": "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient4/Rigid_Prediction/data/Bartoli/right_ridge.vtk",
+      "colour": [
+        120,
+        160,
+        120
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    },
+    "left_ridge": {
+      "file": "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient4/Rigid_Prediction/data/Bartoli/left_ridge.vtk",
+      "colour": [
+        120,
+        120,
+        170
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    },
+    "bottom_liver": {
+      "file": "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient4/Rigid_Prediction/data/Bartoli/bottom_liver_new1.vtk",
+      "colour": [
+        0,
+        0,
+        120
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    },
+    "ligament": {
+      "file": "C:/Users/hanyu/PycharmProjects/Liver_Non_Rigid_Registration_patient4/Rigid_Prediction/data/Bartoli/ligament.vtk",
+      "colour": [
+        120,
+        120,
+        95
+      ],
+      "opacity": 1.0,
+      "pickable": false,
+      "visibility": true
+    }
+  }
+}
