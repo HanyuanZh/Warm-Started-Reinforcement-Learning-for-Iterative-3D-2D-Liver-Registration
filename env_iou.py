@@ -42,8 +42,8 @@ import kornia.morphology as morph
 # =========================
 class VTKRenderer:
     """
-    合并 VTK 网格 → PyTorch3D Meshes
-    仅在需要时进行 RGB 着色渲染；平时只用一次 rasterizer 得到 fragments / depth / pix_to_face。
+    Merges VTK meshes into PyTorch3D Meshes.
+    Only performs RGB shading rendering when needed; normally uses rasterizer once to get fragments/depth/pix_to_face.
     """
     def __init__(
         self,
@@ -63,7 +63,7 @@ class VTKRenderer:
         self.surfaces = surfaces
         self.use_shading = use_shading
 
-        # 原始（全尺寸）内参
+        # Original (full-size) intrinsics
         self.W_full = float(camera_params["W"])
         self.H_full = float(camera_params["H"])
         self.fx_full = float(camera_params["fx"])
@@ -71,11 +71,11 @@ class VTKRenderer:
         self.cx_full = float(camera_params["cx"])
         self.cy_full = float(camera_params["cy"])
 
-        # 目标渲染分辨率
+        # Target rendering resolution
         self.out_W = int(out_size)
         self.out_H = int(out_size)
 
-        # 栅格化参数
+        # Rasterization parameters
         self.faces_per_pixel = int(faces_per_pixel)
         self.blur_radius = float(blur_radius)
         self.zfar = float(zfar)
@@ -83,7 +83,7 @@ class VTKRenderer:
         self._init_camera_and_rasterizer(extrinsic_matrix)
         self._load_meshes()
 
-        # 缓存
+        # Cache
         self._rendered = False
         self._fragments = None
         self._depth_buffer = None
@@ -100,7 +100,7 @@ class VTKRenderer:
         R = extrinsic[:3, :3].unsqueeze(0)
         T = extrinsic[:3, 3].unsqueeze(0)
 
-        # 缩放内参加到 out_size
+        # Scale intrinsics to out_size
         scale_x = self.out_W / self.W_full
         scale_y = self.out_H / self.H_full
         fx_small = self.fx_full * scale_x
@@ -198,691 +198,453 @@ class VTKRenderer:
         for name, info in self.mesh_info.items():
             f_s, f_e = info["face_start"], info["face_end"]
             face_to_component[f_s:f_e] = info["comp_id"]
+
+        self.merged_verts = merged_verts
+        self.merged_faces = merged_faces
+        self.merged_colors = merged_colors
         self.face_to_component = face_to_component
-        self.comp_id_to_name = {info["comp_id"]: name for name, info in self.mesh_info.items()}
 
-        textures = TexturesVertex(verts_features=merged_colors.unsqueeze(0))
-        self.merged_mesh = Meshes(verts=[merged_verts], faces=[merged_faces], textures=textures)
+        textures = TexturesVertex(verts_features=[merged_colors])
+        self.mesh = Meshes(verts=[merged_verts], faces=[merged_faces], textures=textures)
 
-    def _ensure_rasterized(self):
-        if self._rendered and (self._fragments is not None):
-            return
-        fragments = self.rasterizer(self.merged_mesh)
-        depth = fragments.zbuf[0, ..., 0]            # (H,W)
-        pix2face = fragments.pix_to_face[0, ..., 0]  # (H,W)
-
-        comp_ids = torch.full((self.out_H, self.out_W), -1, dtype=torch.int64, device=self.device)
-        valid = (pix2face >= 0)
-        comp_ids[valid] = self.face_to_component[pix2face[valid]]
-
-        masks = {}
-        for comp_id, name in self.comp_id_to_name.items():
-            masks[name] = (comp_ids == comp_id).to(torch.uint8)
-
+    def render(self, target_mask_name: Optional[str] = None) -> Tuple[torch.Tensor, ...]:
+        """
+        Returns: (rgb_image, pix_to_face, depth_buffer)
+        If target_mask_name is not None, generate mask only for that component.
+        """
+        fragments = self.rasterizer(self.mesh)
         self._fragments = fragments
-        self._depth_buffer = depth
-        self._pix_to_face = pix2face
-        self._masks = masks
+        self._pix_to_face = fragments.pix_to_face
+        self._depth_buffer = fragments.zbuf
+
+        depth_map = fragments.zbuf[0, :, :, 0]
+        depth_buffer = depth_map.clone()
+
+        pix_to_face_flat = self._pix_to_face[0, :, :, 0]
+
+        if self.use_shading and self.rgb_renderer is not None:
+            images = self.rgb_renderer(self.mesh)
+            rgb_img = images[0, :, :, :3]
+        else:
+            rgb_img = torch.zeros((self.out_H, self.out_W, 3), device=self.device, dtype=torch.float32)
+
+        if target_mask_name is not None:
+            if target_mask_name in self.mesh_info:
+                info = self.mesh_info[target_mask_name]
+                comp_id = info["comp_id"]
+                face_ids = self.face_to_component[pix_to_face_flat]
+                mask_single = (face_ids == comp_id).float()
+                self._masks[target_mask_name] = mask_single
+            else:
+                self._masks[target_mask_name] = torch.zeros((self.out_H, self.out_W), device=self.device)
+
+        self._rgb_image = rgb_img
         self._rendered = True
-        self._rgb_image = None
+        return rgb_img, self._pix_to_face, depth_buffer
 
-    def render_rgb(self):
-        if not self.use_shading:
-            raise RuntimeError("use_shading=False 时未构造 RGB 渲染器。")
-        if self._rgb_image is None:
-            self._ensure_rasterized()
-            img = self.rgb_renderer(self.merged_mesh)  # (1,H,W,3)
-            self._rgb_image = img[0, ..., :3]          # (H,W,3)
-        return self._rgb_image.clone()
+    def get_component_mask(self, name: str) -> torch.Tensor:
+        """
+        Returns mask for a specific component name (1.0 = visible, 0.0 = background).
+        """
+        if name in self._masks:
+            return self._masks[name]
+        if self._pix_to_face is None:
+            raise RuntimeError("Must call render() first.")
 
-    def get_depth(self, invert: bool = True, eps: float = 1e-6,
-                  use_percentile: bool = True, p: float = 0.95,
-                  component_name: str = None):
-        self._ensure_rasterized()
-        depth = self._depth_buffer.clone()
-        pix2face = self._pix_to_face
-
-        valid = (pix2face >= 0)
-        if not invert:
-            out = depth
+        if name in self.mesh_info:
+            info = self.mesh_info[name]
+            comp_id = info["comp_id"]
+            pix_to_face_flat = self._pix_to_face[0, :, :, 0]
+            face_ids = self.face_to_component[pix_to_face_flat]
+            mask = (face_ids == comp_id).float()
+            self._masks[name] = mask
+            return mask
         else:
-            inv = torch.zeros_like(depth)
-            inv[valid] = 1.0 / (depth[valid] + eps)
-            if valid.any():
-                if use_percentile:
-                    scale = torch.quantile(inv[valid], q=p).clamp_min(eps)
-                else:
-                    scale = inv[valid].max().clamp_min(eps)
-                inv = (inv / scale).clamp_(0, 1)
-            out = inv
+            mask = torch.zeros((self.out_H, self.out_W), device=self.device)
+            self._masks[name] = mask
+            return mask
 
-        if component_name is not None:
-            mask = self.get_mask(component_name).float()
-            out = out * mask
-        return out
-
-    def get_mask(self, component_name: str = None):
-        self._ensure_rasterized()
-        if component_name is None:
-            return {n: m.clone() for n, m in self._masks.items()}
-        if component_name not in self._masks:
-            raise ValueError(f"Component '{component_name}' 不存在，可选：{list(self._masks.keys())}")
-        return self._masks[component_name].clone()
-
-    def update_camera_matrix(self, new_extrinsic_matrix: Union[torch.Tensor, np.ndarray]):
-        if isinstance(new_extrinsic_matrix, np.ndarray):
-            extrinsic = torch.from_numpy(new_extrinsic_matrix).float().to(self.device)
-        else:
-            extrinsic = new_extrinsic_matrix.float().to(self.device)
-
-        R_new = extrinsic[:3, :3].unsqueeze(0)
-        T_new = extrinsic[:3, 3].unsqueeze(0)
-        self.cameras.R = R_new
-        self.cameras.T = T_new
-        self.rasterizer.cameras = self.cameras
-        if self.shader is not None:
-            self.shader.cameras = self.cameras
-
-        # reset caches
+    def clear_cache(self):
         self._rendered = False
         self._fragments = None
         self._depth_buffer = None
         self._pix_to_face = None
-        self._masks = {}
+        self._masks.clear()
         self._rgb_image = None
 
 
-def process_liver_masks_tensor_all_torch_ultra_fast(
-    liver_mask: torch.Tensor,
-    left_ridge: torch.Tensor,
-    right_ridge: torch.Tensor,
-    ligament: torch.Tensor,
-    bottom_liver: torch.Tensor,
-    device: Union[torch.device, str] = "cuda",
-    out_size: int = 128,
-):
-    device = torch.device(device)
-
-    def _resize01(x):
-        x = x.to(device).float()
-        x = F.interpolate(x.unsqueeze(0).unsqueeze(0), size=(out_size, out_size), mode="nearest")
-        return x.squeeze(0).squeeze(0)  # (H,W)
-
-    liver = _resize01(liver_mask)
-    left = _resize01(left_ridge)
-    right = _resize01(right_ridge)
-    lig = _resize01(ligament)
-    bl = _resize01(bottom_liver)
-
-    H, W = out_size, out_size
-    if (left.sum() + right.sum() + lig.sum() + liver.sum()) / (H * W) < 1e-4:
-        return None
-
-    kernel3 = torch.ones((3, 3), device=device)
-    dilated = morph.dilation(liver.unsqueeze(0).unsqueeze(0), kernel3).squeeze(0).squeeze(0)
-    edges = ((dilated > 0) & (liver == 0)).float()
-
-    kernel15 = torch.ones((15, 15), device=device)
-    spine_dil = morph.dilation((left + right + lig + bl).unsqueeze(0).unsqueeze(0), kernel15).squeeze(0).squeeze(0)
-    spine_dil = (spine_dil > 0).float()
-
-    edges_clean = edges.clone()
-    edges_clean[spine_dil > 0] = 0.0
-
-    final = torch.zeros((4, H, W), dtype=torch.uint8, device=device)
-    final[3][edges_clean > 0] = 255  # Edge
-    final[2][left > 0] = 255        # R
-    final[1][right > 0] = 255       # G
-    final[0][lig > 0] = 255         # B
-
-    return final.permute(1, 2, 0)  # (H,W,4)
-
-
-def re_rendering(
-    matrix: Union[torch.Tensor, np.ndarray],
-    renderer: VTKRenderer,
-    device: Union[torch.device, str] = "cuda",
-    out_size: int = 128,
-) -> torch.Tensor:
-    """
-    返回 (6, H, W)，通道：
-      [ B(韧带), G(右脊), R(左脊), Edge, invDepth(归一化), liverMask ]
-    """
-    device = torch.device(device)
-    renderer.update_camera_matrix(matrix)
-
-    parts = ["liver", "left_ridge", "right_ridge", "ligament", "bottom_liver"]
-    masks = {p: renderer.get_mask(p) for p in parts}  # (H,W), uint8
-
-    if masks["liver"].sum() == 0:
-        return torch.zeros((6, out_size, out_size), device=device)
-
-    sem_hwC = process_liver_masks_tensor_all_torch_ultra_fast(
-        liver_mask=masks["liver"],
-        left_ridge=masks["left_ridge"],
-        right_ridge=masks["right_ridge"],
-        ligament=masks["ligament"],
-        bottom_liver=masks["bottom_liver"],
-        device=device,
-        out_size=out_size
-    )
-    if sem_hwC is None:
-        return torch.zeros((6, out_size, out_size), device=device)
-
-    sem = (sem_hwC.permute(2, 0, 1).float() / 255.0).to(device)  # (4,H,W)
-
-    depth_inv = renderer.get_depth(invert=True, component_name="liver")  # (H,W)
-    depth_inv = F.interpolate(depth_inv.unsqueeze(0).unsqueeze(0), size=(out_size, out_size), mode="nearest").squeeze(0).squeeze(0)
-
-    liver_mask = masks["liver"].float()
-    liver_mask = F.interpolate(liver_mask.unsqueeze(0).unsqueeze(0), size=(out_size, out_size), mode="nearest").squeeze(0).squeeze(0)
-
-    out = torch.cat((sem, depth_inv.unsqueeze(0), liver_mask.unsqueeze(0)), dim=0)  # (6,H,W)
-    return out
-
-
 # =============================
-#   Lie utilities: SO(3), SE(3)
-# =============================
-def _skew(w: Tensor) -> Tensor:
-    wx, wy, wz = w.unbind()
-    zeros = torch.zeros_like(wx)
-    row1 = torch.stack([zeros, -wz, wy])
-    row2 = torch.stack([wz, zeros, -wx])
-    row3 = torch.stack([-wy, wx, zeros])
-    return torch.stack([row1, row2, row3])
-
-
-def so3_exp(w: Tensor) -> Tensor:
-    theta = torch.linalg.norm(w)
-    I = torch.eye(3, dtype=w.dtype, device=w.device)
-    K = _skew(w)
-    K2 = K @ K
-    if theta < 1e-8:
-        return I + K + 0.5 * K2
-    s, c = torch.sin(theta), torch.cos(theta)
-    return I + (s / theta) * K + ((1 - c) / (theta * theta)) * K2
-
-
-def se3_exp(xi: Tensor) -> Tensor:
-    assert xi.numel() == 6
-    v = xi[:3]
-    w = xi[3:]
-    R = so3_exp(w)
-    theta = torch.linalg.norm(w)
-    I = torch.eye(3, dtype=xi.dtype, device=xi.device)
-    K = _skew(w)
-    K2 = K @ K
-    if theta < 1e-8:
-        V = I + 0.5 * K + (1.0 / 6.0) * K2
-    else:
-        s, c = torch.sin(theta), torch.cos(theta)
-        V = I + ((1 - c) / (theta * theta)) * K + ((theta - s) / (theta ** 3)) * K2
-    t = V @ v
-    Tm = torch.eye(4, dtype=xi.dtype, device=xi.device)
-    Tm[:3, :3] = R
-    Tm[:3, 3] = t
-    return Tm
-
-
-# =============================
-#        Dataclasses
+#     Registration Env
 # =============================
 @dataclass
-class DiscreteStepSizes:
-    trans_mm: float = 1.0
-    rot_deg: float = 1.0
+class EnvConfig:
+    out_size: int = 128
+    surfaces: Optional[Dict[str, Dict]] = None
+    camera_params: Optional[Dict[str, float]] = None
 
-    @property
-    def rot_rad(self) -> float:
-        return float(np.deg2rad(self.rot_deg))
+    max_steps: int = 50
+    trans_step: float = 5.0
+    rot_step_deg: float = 2.0
+
+    target_mask_name: str = "bottom_liver"
+    source_mask_name: str = "liver"
+
+    add_initial_noise: bool = True
+    noise_trans_range: Tuple[float, float] = (-30.0, 30.0)
+    noise_rot_range_deg: Tuple[float, float] = (-10.0, 10.0)
+
+    reward_mode: Literal[
+        "improvement",
+        "neg_mse",
+        "improvement_ratio",
+        "improvement_log",
+        "progress_log_to_thresh",
+        "log_progress_with_threshold",
+        "curr_first_positive",
+        "curr_delta",
+        "simple_step_with_final_bonus"
+    ] = "simple_step_with_final_bonus"
+    reward_scale: float = 1.0
+    success_threshold: float = 50.0
+    success_bonus: float = 50.0
+    success_crossing_bonus: float = 0.0
+    clip_reward: Optional[Tuple[float, float]] = None
+
+    mse_small_bonus_threshold: float = 30.0
+    mse_small_bonus: float = 5.0
+
+    empty_penalty: float = -10.0
+    handle_empty: Literal["terminate", "rollback", "penalty"] = "terminate"
+
+    curr_first_alpha: float = 0.5
+    threshold_focus_coef: float = 0.0
+
+    final_bonus_scale: float = 100.0
+
+    obs_mode: Literal["rgb", "mask_overlay"] = "mask_overlay"
+    obs_overlay_alpha: float = 0.5
+
+    bad_streak_limit: int = 0
+
+    num_pairs: int = 1
+    extrinsics: Optional[list] = None
+
+    use_random_seed: bool = False
+    episode_seed: Optional[int] = None
 
 
-# =============================
-#           Env (MSE reward)
-# =============================
-class SE3PoseEnvDiscrete(gym.Env):
+class RegistrationEnv(gym.Env):
     """
-    观测：Tuple( current_6ch, target_6ch )
-    奖励（支持多种模式）：
-      - "improvement": mse 的绝对改善
-      - "neg_mse": 直接用 -mse
-      - "improvement_ratio": 相对改善 (Δ/mse_prev)
-      - "improvement_log": 对数改善 log(mse_prev+c)-log(mse+c)
-      - "progress_log_to_thresh": 以阈值为参考的对数进度
-      - "log_progress_with_threshold": 对数改善 + 逼近阈值强化 + 首次跨阈值额外奖励
-      - "curr_first_positive": 以当前误差为主、改进为辅（严格对称负惩罚）
-      - "curr_delta": 允许负数惩罚；按本步 MSE 变化的归一化增量
-      - "simple_step_with_final_bonus": 每步 ±1，终局按总体改进比例给大奖励
+    Reinforcement Learning Environment for 2D/3D Registration.
+    
+    Action space: 6D continuous (tx, ty, tz, rx, ry, rz).
+    Observation: Two images (current rendered image, target image).
+    Reward: Based on improvement of MSE between masks.
     """
-    metadata = {"render_modes": []}
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 30}
 
-    def __init__(
-        self,
-        renderer: VTKRenderer,
-        target_image_6ch: Optional[Tensor] = None,
-        start_extrinsic: Optional[Tensor] = None,
-        out_size: int = 128,
-        device: Union[str, torch.device] = "cuda" if torch.cuda.is_available() else "cpu",
-        step_sizes: DiscreteStepSizes = None,
-        max_steps: int = 256,
-        compose_mode: Literal["left", "right"] = "left",
-        model_pts: Optional[Tensor] = None,
-        target_extrinsic: Optional[Tensor] = None,
-        empty_image_threshold: float = 1e-6,
-        check_empty_image: bool = True,
-        dataset: Optional[torch.utils.data.Dataset] = None,
-        dataset_mode: Literal["sequential", "random", "fixed"] = "sequential",
-        dataset_start_index: int = 0,
-        fixed_mat_ids: Optional[Tuple[int, int]] = None,
-        reward_mode: Literal[
-            "improvement",
-            "neg_mse",
-            "improvement_ratio",
-            "improvement_log",
-            "progress_log_to_thresh",
-            "log_progress_with_threshold",
-            "curr_first_positive",
-            "curr_delta",
-            "simple_step_with_final_bonus",
-        ] = "curr_first_positive",
-        reward_scale: float = 1.0,
-        success_threshold: float = 300.0,
-        success_bonus: float = 15.0,
-        success_crossing_bonus: float = 10.0,
-        threshold_focus_coef: float = 1.0,
-        empty_penalty: float = -5.0,
-        mse_small_bonus_threshold: float = 1200.0,
-        mse_small_bonus: float = 0.0,
-        clip_reward: Optional[Tuple[float, float]] = None,
-        final_bonus_scale: float = 100.0,
-        curr_first_alpha: float = 0.1,
-        handle_empty: Literal["terminate", "undo", "rollback"] = "undo",
-        bad_streak_limit: int = 0,
-        adaptive_step: bool = True,
-        coarse_trans_mm: float = 5.0,
-        coarse_rot_deg: float = 5.0,
-        fine_trans_mm: float = 2.0,
-        fine_rot_deg: float = 2.0,
-        fine_threshold: float = 100.0,
-    ) -> None:
+    def __init__(self, config: EnvConfig):
         super().__init__()
-        assert compose_mode in ("left", "right")
+        self.cfg = config
 
-        if step_sizes is None:
-            step_sizes = DiscreteStepSizes()
+        if self.cfg.surfaces is None:
+            self.cfg.surfaces = get_default_surfaces()
+        if self.cfg.camera_params is None:
+            self.cfg.camera_params = get_default_camera_params()
 
-        self.renderer = renderer
-        self.device = torch.device(device)
-        self.out_size = int(out_size)
-        self.compose_mode = compose_mode
-        self.step_sizes = step_sizes
-        self.max_steps = int(max_steps)
-        self.target = None if target_image_6ch is None else target_image_6ch.to(self.device).float().clamp(0, 1)
-        self.start_extrinsic = None if start_extrinsic is None else start_extrinsic.to(self.device).float()
-        self.target_extrinsic = None if target_extrinsic is None else target_extrinsic.to(self.device).float()
-        self.model_pts = None if model_pts is None else model_pts.to(self.device).float()
-        self.empty_image_threshold = float(empty_image_threshold)
-        self.check_empty_image = bool(check_empty_image)
-        self.dataset = dataset
-        self.dataset_mode = dataset_mode
-        self.dataset_cursor = int(dataset_start_index)
-        self.fixed_mat_ids = fixed_mat_ids
-        self._idpair_to_dsindex: Optional[Dict[Tuple[int, int], int]] = None
+        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(6,), dtype=np.float32)
 
-        self.observation_space = spaces.Tuple((
-            spaces.Box(low=0.0, high=1.0, shape=(6, self.out_size, self.out_size), dtype=np.float32),
-            spaces.Box(low=0.0, high=1.0, shape=(6, self.out_size, self.out_size), dtype=np.float32),
-        ))
-        self.action_space = spaces.Discrete(12)
-        self._action_names = ["+x", "-x", "+y", "-y", "+z", "-z", "+rx", "-rx", "+ry", "-ry", "+rz", "-rz"]
+        C = 3 if self.cfg.obs_mode == "rgb" else 1
+        obs_h = self.cfg.out_size
+        obs_w = self.cfg.out_size
+        single_obs = spaces.Box(low=0, high=1, shape=(C, obs_h, obs_w), dtype=np.float32)
+        self.observation_space = spaces.Tuple((single_obs, single_obs))
 
-        self.extrinsic: Tensor = (self.start_extrinsic.clone() if self.start_extrinsic is not None else torch.eye(4))
-        self.curr_img: Optional[Tensor] = None
-        self.step_count = 0
-        self.score: float = 0.0
-        self.episode_log = []
-        self.current_pair_idx: Optional[int] = None
+        self._action_names = [
+            "tx+", "tx-", "ty+", "ty-", "tz+", "tz-",
+            "rx+", "rx-", "ry+", "ry-", "rz+", "rz-"
+        ]
 
-        self.reward_mode = reward_mode
-        self.reward_scale = float(reward_scale)
-        self.success_threshold = float(success_threshold)
-        self.success_bonus = float(success_bonus)
-        self.success_crossing_bonus = float(success_crossing_bonus)
-        self.threshold_focus_coef = float(threshold_focus_coef)
-        self.empty_penalty = float(empty_penalty)
-        self.mse_small_bonus_threshold = float(mse_small_bonus_threshold)
-        self.mse_small_bonus = float(mse_small_bonus)
-        self.clip_reward = clip_reward
-        self.curr_first_alpha = float(curr_first_alpha)
-        self.final_bonus_scale = float(final_bonus_scale)
-        self.handle_empty = handle_empty
-        self.bad_streak_limit = int(bad_streak_limit)
-        self.adaptive_step = bool(adaptive_step)
-        self.coarse_trans_mm = float(coarse_trans_mm)
-        self.coarse_rot_deg = float(coarse_rot_deg)
-        self.fine_trans_mm = float(fine_trans_mm)
-        self.fine_rot_deg = float(fine_rot_deg)
-        self.fine_threshold = float(fine_threshold)
+        self.target_pairs = self._build_target_pairs()
+        self.current_pair_idx = 0
 
-        self.prev_extrinsic: Optional[Tensor] = None
-        self.best_extrinsic: Optional[Tensor] = None
-        self.bad_streak: int = 0
-        self.last_mse: Optional[float] = None
-        self.best_mse: Optional[float] = None
-        self.initial_mse: Optional[float] = None
+        self.extrinsic = None
+        self.renderer_source = None
+        self.renderer_target = None
+        self.target_mask = None
+        self.curr_img = None
 
-        if self.dataset is None:
-            if self.start_extrinsic is None or self.target_extrinsic is None:
-                raise ValueError("When `dataset` is None, you must provide both `start_extrinsic` and `target_extrinsic`.")
-
-    def _ensure_idpair_index(self):
-        if self._idpair_to_dsindex is not None:
-            return
-        assert self.dataset is not None, "Dataset must be provided"
-        self._idpair_to_dsindex = {}
-        for i in range(len(self.dataset)):
-            try:
-                sample = self.dataset[i]
-                ids = sample.get("index_pair", None)
-                if ids is not None:
-                    s_id = int(ids[0]); t_id = int(ids[1])
-                    self._idpair_to_dsindex.setdefault((s_id, t_id), i)
-            except Exception:
-                continue
-
-    def _action_id_to_xi(self, a_id: int) -> Tensor:
-        xi = torch.zeros(6, dtype=torch.float32, device=self.device)
-        
-        if self.adaptive_step and (self.last_mse is not None) and np.isfinite(self.last_mse):
-            if self.last_mse < self.fine_threshold:
-                s_t = self.fine_trans_mm
-                s_r = np.deg2rad(self.fine_rot_deg)
-            else:
-                s_t = self.coarse_trans_mm
-                s_r = np.deg2rad(self.coarse_rot_deg)
-        else:
-            s_t = float(self.step_sizes.trans_mm)
-            s_r = float(self.step_sizes.rot_rad)
-        
-        if   a_id == 0:  xi[0] = +s_t
-        elif a_id == 1:  xi[0] = -s_t
-        elif a_id == 2:  xi[1] = +s_t
-        elif a_id == 3:  xi[1] = -s_t
-        elif a_id == 4:  xi[2] = +s_t
-        elif a_id == 5:  xi[2] = -s_t
-        elif a_id == 6:  xi[3] = +s_r
-        elif a_id == 7:  xi[3] = -s_r
-        elif a_id == 8:  xi[4] = +s_r
-        elif a_id == 9:  xi[4] = -s_r
-        elif a_id == 10: xi[5] = +s_r
-        elif a_id == 11: xi[5] = -s_r
-        else:
-            raise ValueError(f"Invalid action id: {a_id}")
-        return xi
-
-    def _apply_delta(self, delta_T: Tensor) -> None:
-        if self.compose_mode == "left":
-            self.extrinsic = delta_T @ self.extrinsic
-        else:
-            self.extrinsic = self.extrinsic @ delta_T
-
-    def _render_obs(self) -> Tuple[Tensor, Tensor]:
-        current_img = re_rendering(self.extrinsic, self.renderer, device=self.device, out_size=self.out_size)
-        target_img  = re_rendering(self.target_extrinsic, self.renderer, device=self.device, out_size=self.out_size)
-        return current_img.float().clamp(0, 1), target_img.float().clamp(0, 1)
-
-    # def _compute_mse(self) -> float:
-    #     if self.model_pts is None:
-    #         raise RuntimeError("`model_pts` is required for MSE reward but is None.")
-    #     if self.target_extrinsic is None:
-    #         raise RuntimeError("`target_extrinsic` is required for MSE reward but is None.")
-    #
-    #     pose_error = torch.linalg.inv(self.target_extrinsic) @ self.extrinsic
-    #     pts = self.model_pts.unsqueeze(0)
-    #     R = pose_error[:3, :3].unsqueeze(0)
-    #     t = pose_error[:3, 3].unsqueeze(0)
-    #     pts_trans = torch.bmm(pts, R.transpose(1, 2)) + t.unsqueeze(1)
-    #     mse = torch.mean((pts - pts_trans) ** 2).item()
-    #     if not np.isfinite(mse):
-    #         mse = float("inf")
-    #     return float(mse)
-
-    def _compute_mse(self) -> float:
-        """
-        与训练时一致的 MSE 计算方式:
-        1. 从 start 预测 offset 到 current: pred_offset = start^-1 @ current
-        2. GT offset: gt_offset = start^-1 @ target
-        3. 应用到点云上计算误差
-        """
-        if self.model_pts is None:
-            raise RuntimeError("`model_pts` is required for MSE reward but is None.")
-        if self.target_extrinsic is None or self.start_extrinsic is None:
-            raise RuntimeError("Both `target_extrinsic` and `start_extrinsic` are required.")
-
-        # GT: mat1 -> mat2 的变换
-        # 等价于你训练时的 mat2 = mat1 @ offset_gt
-        # 所以 offset_gt = mat1^-1 @ mat2
-        mat1 = self.start_extrinsic
-        mat2 = self.target_extrinsic
-        mat2_pred = self.extrinsic  # 当前预测的位姿
-
-        # 计算 pose error (和训练代码完全一致)
-        pose_error = torch.linalg.inv(mat2) @ mat2_pred
-        # print(pose_error)
-        # 用 pose_error 变换点云
-        pts = self.model_pts  # (N, 3)
-        R = pose_error[:3, :3]
-        t = pose_error[:3, 3]
-        pts_transformed = pts @ R.T + t  # (N, 3)
-
-        # 计算 MSE (变换前后的差异)
-        mse = torch.mean((pts - pts_transformed) ** 2).item()
-
-        if not np.isfinite(mse):
-            mse = float("inf")
-
-        return float(mse)
-
-        # return float(mse)
-    def _is_empty_mask(self, curr6: Tensor, min_frac: float = 1e-4) -> bool:
-        area = (curr6[5] > 0.5).float().sum().item()
-        H, W = curr6.shape[-2:]
-        return bool(area / (H * W) < min_frac)
-
-    def _pull_pair_from_dataset(self,
-                                forced_idx: Optional[int] = None,
-                                forced_mat_ids: Optional[Tuple[int, int]] = None):
-        assert self.dataset is not None, "Dataset must be provided"
-
-        if forced_mat_ids is not None:
-            self._ensure_idpair_index()
-            key = (int(forced_mat_ids[0]), int(forced_mat_ids[1]))
-            if key not in self._idpair_to_dsindex:
-                raise RuntimeError(f"未在数据集中找到指定的 mat id 组合: {key}")
-            idx = self._idpair_to_dsindex[key]
-        elif forced_idx is not None:
-            idx = int(forced_idx) % len(self.dataset)
-        else:
-            if self.dataset_mode == "random":
-                idx = np.random.randint(len(self.dataset))
-            elif self.dataset_mode == "fixed":
-                if self.fixed_mat_ids is None:
-                    raise RuntimeError("dataset_mode='fixed' 需要 fixed_mat_ids=(start_id, target_id)")
-                self._ensure_idpair_index()
-                key = (int(self.fixed_mat_ids[0]), int(self.fixed_mat_ids[1]))
-                if key not in self._idpair_to_dsindex:
-                    raise RuntimeError(f"未在数据集中找到 fixed_mat_ids: {key}")
-                idx = self._idpair_to_dsindex[key]
-            else:
-                idx = self.dataset_cursor % len(self.dataset)
-                self.dataset_cursor += 1
-
-        sample = self.dataset[idx]
-        p3d_pair: Tensor = sample["p3d"].to(self.device).float()
-        indices: Tensor = sample.get("index_pair", torch.tensor([-1, -1]))
-        return int(idx), indices, p3d_pair[0], p3d_pair[1]
-
-    def reset(self, *, seed: int | None = None, options: dict | None = None):
-        super().reset(seed=seed)
-
-        forced_idx = None
-        if options is not None and "pair_idx" in options:
-            forced_idx = int(options["pair_idx"])
-
-        sample_idx = -1
-        pair_ids = torch.tensor([-1, -1], device=self.device)
-
-        if self.dataset is not None:
-            sample_idx, pair_ids, start_extr, target_extr = self._pull_pair_from_dataset(
-                forced_idx=forced_idx,
-                forced_mat_ids=self.fixed_mat_ids
-            )
-            self.start_extrinsic = start_extr
-            self.target_extrinsic = target_extr
-
-            if forced_idx is not None:
-                expected = int(forced_idx) % len(self.dataset)
-                if sample_idx != expected:
-                    raise RuntimeError(f"索引不匹配! 期望: {expected}, 实际: {sample_idx}")
-
-        elif self.start_extrinsic is None or self.target_extrinsic is None:
-            raise RuntimeError("No dataset and no manual start/target provided.")
-
-        self.current_pair_idx = int(sample_idx)
-        self.extrinsic = self.start_extrinsic.clone()
         self.step_count = 0
         self.score = 0.0
+        self.last_mse = None
+        self.initial_mse = None
+        self.best_mse = None
+        self.best_extrinsic = None
+        self.bad_streak = 0
+        self.episode_log = []
+
+    def _build_target_pairs(self):
+        if self.cfg.extrinsics is not None and len(self.cfg.extrinsics) > 0:
+            return self.cfg.extrinsics
+        
+        # Generate random extrinsics
+        np.random.seed(42)
+        pairs = []
+        for _ in range(self.cfg.num_pairs):
+            tx = np.random.uniform(-50, 50)
+            ty = np.random.uniform(-50, 50)
+            tz = np.random.uniform(-100, 100)
+            rx = np.deg2rad(np.random.uniform(-15, 15))
+            ry = np.deg2rad(np.random.uniform(-15, 15))
+            rz = np.deg2rad(np.random.uniform(-15, 15))
+            
+            R = self._euler_to_rotation_matrix(rx, ry, rz)
+            T = np.array([tx, ty, tz], dtype=np.float32)
+            extrinsic_gt = np.eye(4, dtype=np.float32)
+            extrinsic_gt[:3, :3] = R
+            extrinsic_gt[:3, 3] = T
+            pairs.append(extrinsic_gt)
+        return pairs
+
+    @staticmethod
+    def _euler_to_rotation_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx), -np.sin(rx)],
+            [0, np.sin(rx), np.cos(rx)]
+        ], dtype=np.float32)
+        Ry = np.array([
+            [np.cos(ry), 0, np.sin(ry)],
+            [0, 1, 0],
+            [-np.sin(ry), 0, np.cos(ry)]
+        ], dtype=np.float32)
+        Rz = np.array([
+            [np.cos(rz), -np.sin(rz), 0],
+            [np.sin(rz), np.cos(rz), 0],
+            [0, 0, 1]
+        ], dtype=np.float32)
+        return Rz @ Ry @ Rx
+
+    def _init_renderers(self, target_extrinsic: np.ndarray):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        self.renderer_target = VTKRenderer(
+            surfaces=self.cfg.surfaces,
+            camera_params=self.cfg.camera_params,
+            extrinsic_matrix=target_extrinsic,
+            device=device,
+            out_size=self.cfg.out_size,
+            faces_per_pixel=2,
+            blur_radius=0.0,
+            use_shading=False,
+        )
+        _, _, _ = self.renderer_target.render(target_mask_name=self.cfg.target_mask_name)
+        self.target_mask = self.renderer_target.get_component_mask(self.cfg.target_mask_name)
+
+        self.renderer_source = VTKRenderer(
+            surfaces=self.cfg.surfaces,
+            camera_params=self.cfg.camera_params,
+            extrinsic_matrix=self.extrinsic.cpu().numpy(),
+            device=device,
+            out_size=self.cfg.out_size,
+            faces_per_pixel=2,
+            blur_radius=0.0,
+            use_shading=False,
+        )
+
+    def _add_noise_to_extrinsic(self, extrinsic_gt: np.ndarray, rng: np.random.Generator) -> torch.Tensor:
+        tx_noise = rng.uniform(*self.cfg.noise_trans_range)
+        ty_noise = rng.uniform(*self.cfg.noise_trans_range)
+        tz_noise = rng.uniform(*self.cfg.noise_trans_range)
+        
+        rx_noise = np.deg2rad(rng.uniform(*self.cfg.noise_rot_range_deg))
+        ry_noise = np.deg2rad(rng.uniform(*self.cfg.noise_rot_range_deg))
+        rz_noise = np.deg2rad(rng.uniform(*self.cfg.noise_rot_range_deg))
+
+        noise_rot = self._euler_to_rotation_matrix(rx_noise, ry_noise, rz_noise)
+        noise_trans = np.array([tx_noise, ty_noise, tz_noise], dtype=np.float32)
+
+        R_gt = extrinsic_gt[:3, :3]
+        T_gt = extrinsic_gt[:3, 3]
+
+        R_new = R_gt @ noise_rot
+        T_new = T_gt + noise_trans
+
+        noisy_extrinsic = np.eye(4, dtype=np.float32)
+        noisy_extrinsic[:3, :3] = R_new
+        noisy_extrinsic[:3, 3] = T_new
+
+        return torch.from_numpy(noisy_extrinsic).float()
+
+    def reset(self, seed: Optional[int] = None, options: Optional[dict] = None):
+        if self.cfg.use_random_seed:
+            super().reset(seed=seed)
+            rng = np.random.default_rng(seed)
+        else:
+            episode_seed = self.cfg.episode_seed if self.cfg.episode_seed is not None else 42
+            rng = np.random.default_rng(episode_seed)
+
+        if options and "pair_idx" in options:
+            self.current_pair_idx = options["pair_idx"]
+        else:
+            self.current_pair_idx = rng.integers(0, len(self.target_pairs))
+
+        target_extrinsic = self.target_pairs[self.current_pair_idx]
+
+        if self.cfg.add_initial_noise:
+            self.extrinsic = self._add_noise_to_extrinsic(target_extrinsic, rng)
+        else:
+            self.extrinsic = torch.from_numpy(target_extrinsic).float()
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.extrinsic = self.extrinsic.to(device)
+
+        self._init_renderers(target_extrinsic)
+
+        self.step_count = 0
+        self.score = 0.0
+        self.last_mse = None
+        self.initial_mse = None
+        self.best_mse = None
+        self.best_extrinsic = None
+        self.bad_streak = 0
+        self.episode_log = []
 
         curr_img, tgt_img = self._render_obs()
         self.curr_img = (curr_img, tgt_img)
-        obs = (curr_img.float().clamp(0, 1), tgt_img.float().clamp(0, 1))
 
-        mse0 = self._compute_mse()
-        self.last_mse = mse0
-        self.best_mse = mse0
-        self.initial_mse = mse0
-        self.prev_extrinsic = self.extrinsic.clone()
-        self.best_extrinsic = self.extrinsic.clone()
-        self.bad_streak = 0
-
-        is_empty = self._is_empty_mask(curr_img)
-
-        self.episode_log = [{
-            "step": 0,
-            "action_id": None,
-            "action_name": "START",
-            "mse": mse0,
-            "reward": 0.0,
-            "is_empty": is_empty,
-            "dataset_sample_idx": sample_idx,
-            "pair_indices": tuple(map(int, pair_ids.detach().cpu().tolist())),
-            "pair_idx": int(sample_idx),
-            "step_mode": "initial",
-        }]
+        mse = self._compute_mse(curr_img, tgt_img)
+        self.last_mse = mse
+        self.initial_mse = mse
 
         info = {
-            "mse": mse0,
-            "best_mse": mse0,
-            "success": bool(mse0 < self.success_threshold) and (not is_empty),
-            "score": self.score,
-            "is_empty": is_empty,
-            "dataset_sample_idx": sample_idx,
-            "pair_indices": tuple(map(int, pair_ids.detach().cpu().tolist())),
-            "pair_idx": int(sample_idx),
+            "mse": mse,
+            "best_mse": mse,
+            "delta_mse": 0.0,
+            "step": 0,
+            "success": False,
+            "score": 0.0,
+            "is_empty": False,
+            "terminated_reason": "reset",
+            "pair_idx": self.current_pair_idx,
+            "step_mode": "reset",
+            "pair_indices": (self.current_pair_idx, len(self.target_pairs)),
         }
 
+        self.episode_log.append({
+            "step": 0,
+            "action_id": -1,
+            "action_name": "reset",
+            "mse": mse,
+            "delta_mse": 0.0,
+            "reward": 0.0,
+            "mse_bonus": 0.0,
+            "is_empty": False,
+            "pair_idx": self.current_pair_idx,
+            "step_mode": "reset",
+            "pair_indices": (self.current_pair_idx, len(self.target_pairs)),
+        })
+
+        obs = (curr_img.float().clamp(0, 1), tgt_img.float().clamp(0, 1))
         return obs, info
 
-    @staticmethod
-    def _reward_curr_first_positive_raw(prev_mse: float,
-                                        curr_mse: float,
-                                        m_ref: float,
-                                        alpha: float,
-                                        eps: float = 1e-8) -> float:
-        curr_score = m_ref / (curr_mse + eps)
-        improv_score = alpha * float(np.log((prev_mse + eps) / (curr_mse + eps)))
-        return curr_score + improv_score
+    def _render_obs(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        self.renderer_source.clear_cache()
+        self.renderer_source._init_camera_and_rasterizer(self.extrinsic.cpu().numpy())
+        _, _, _ = self.renderer_source.render(target_mask_name=self.cfg.source_mask_name)
+        source_mask = self.renderer_source.get_component_mask(self.cfg.source_mask_name)
+
+        if self.cfg.obs_mode == "rgb":
+            curr_rgb = self.renderer_source._rgb_image
+            tgt_rgb = self.renderer_target._rgb_image
+            curr_img = curr_rgb.permute(2, 0, 1)
+            tgt_img = tgt_rgb.permute(2, 0, 1)
+        else:
+            alpha = self.cfg.obs_overlay_alpha
+            curr_overlay = self._overlay_mask(source_mask, alpha)
+            tgt_overlay = self._overlay_mask(self.target_mask, alpha)
+            curr_img = curr_overlay.unsqueeze(0)
+            tgt_img = tgt_overlay.unsqueeze(0)
+
+        return curr_img, tgt_img
 
     @staticmethod
-    def _reward_curr_first_positive_symmetric(prev_mse: float,
-                                              curr_mse: float,
-                                              m_ref: float,
-                                              alpha: float,
-                                              eps: float = 1e-8) -> float:
+    def _overlay_mask(mask: torch.Tensor, alpha: float) -> torch.Tensor:
+        return alpha * mask + (1 - alpha) * torch.ones_like(mask)
+
+    def _compute_mse(self, curr_img: torch.Tensor, tgt_img: torch.Tensor) -> float:
+        diff = (curr_img - tgt_img) ** 2
+        mse_val = diff.mean().item()
+        return mse_val
+
+    def _is_empty_image(self, img: torch.Tensor, threshold: float = 1e-4) -> bool:
+        return (img.abs().max().item() < threshold)
+
+    @staticmethod
+    def _reward_curr_first_positive_symmetric(
+        prev_mse: float,
+        curr_mse: float,
+        m_ref: float,
+        alpha: float = 0.5,
+    ) -> float:
         if not np.isfinite(prev_mse) or not np.isfinite(curr_mse):
-            return -1.0
-        if curr_mse < prev_mse:
-            return SE3PoseEnvDiscrete._reward_curr_first_positive_raw(prev_mse, curr_mse, m_ref, alpha, eps)
-        elif curr_mse > prev_mse:
-            pos_if_improved = SE3PoseEnvDiscrete._reward_curr_first_positive_raw(curr_mse, prev_mse, m_ref, alpha, eps)
-            return -pos_if_improved
-        else:
-            return -alpha * 0.01
-
-    def step(self, action_id: int):
-        self.step_count += 1
-        self.prev_extrinsic = self.extrinsic.clone()
-
-        xi = self._action_id_to_xi(int(action_id))
+            return 0.0
         
-        if self.adaptive_step and (self.last_mse is not None) and np.isfinite(self.last_mse):
-            step_mode = "fine" if self.last_mse < self.fine_threshold else "coarse"
+        eps = 1e-9
+        m_ref = max(m_ref, eps)
+        
+        if curr_mse < m_ref:
+            w = alpha
         else:
-            step_mode = "default"
+            w = 1.0 - alpha
+        
+        delta = prev_mse - curr_mse
+        r = w * delta / max(prev_mse, eps)
+        return float(r)
 
-        delta = se3_exp(xi)
-        self._apply_delta(delta)
+    def step(self, action: Union[np.ndarray, int]):
+        if isinstance(action, int):
+            action_id = action
+            step_mode = "discrete"
+        else:
+            action = np.asarray(action, dtype=np.float32)
+            action_id = np.argmax(np.abs(action))
+            step_mode = "continuous"
+
+        delta = self._action_to_delta(action_id)
+        self.extrinsic = torch.matmul(self.extrinsic, delta)
+        self.step_count += 1
 
         curr_img, tgt_img = self._render_obs()
         self.curr_img = (curr_img, tgt_img)
 
-        is_empty = self._is_empty_mask(curr_img)
+        mse = self._compute_mse(curr_img, tgt_img)
+        is_empty = self._is_empty_image(curr_img)
+
+        delta_mse = (self.last_mse - mse) if (self.last_mse is not None) else 0.0
+
         terminated = False
-        truncated = (self.step_count >= self.max_steps)
+        truncated = (self.step_count >= self.cfg.max_steps)
+        reward = 0.0
+
+        if delta_mse < 0:
+            self.bad_streak += 1
+        else:
+            self.bad_streak = 0
 
         if is_empty:
-            if self.handle_empty == "terminate":
-                reward = self.empty_penalty
-                mse = float('inf')
+            if self.cfg.handle_empty == "terminate":
+                reward = self.cfg.empty_penalty
                 terminated = True
-
-            elif self.handle_empty == "undo":
-                self.extrinsic = self.prev_extrinsic.clone()
-                reward = min(-1.0, self.empty_penalty * 0.2)
-                mse = float('inf')
-                terminated = False
-                curr_img, tgt_img = self._render_obs()
-                self.curr_img = (curr_img, tgt_img)
-
-            elif self.handle_empty == "rollback":
+            elif self.cfg.handle_empty == "rollback":
                 if self.best_extrinsic is not None:
                     self.extrinsic = self.best_extrinsic.clone()
                     curr_img, tgt_img = self._render_obs()
                     self.curr_img = (curr_img, tgt_img)
-                reward = self.empty_penalty
-                mse = float('inf')
+                reward = self.cfg.empty_penalty * 0.5
                 terminated = True
-
             else:
-                reward = self.empty_penalty
-                mse = float('inf')
-                terminated = True
-
-            mse_bonus = 0.0
-            delta_mse = 0.0
-
-        else:
-            mse = self._compute_mse()
-            delta_mse = (self.last_mse - mse) if (self.last_mse is not None and np.isfinite(self.last_mse)) else 0.0
-
-            if (self.last_mse is not None) and np.isfinite(self.last_mse):
-                if mse >= self.last_mse:
-                    self.bad_streak += 1
-                else:
-                    self.bad_streak = 0
-            else:
-                self.bad_streak = 0
+                reward = self.cfg.empty_penalty
 
             if (self.best_mse is None) or (mse < self.best_mse):
                 self.best_mse = mse
@@ -893,123 +655,123 @@ class SE3PoseEnvDiscrete(gym.Env):
                     self.extrinsic = self.best_extrinsic.clone()
                     curr_img, tgt_img = self._render_obs()
                     self.curr_img = (curr_img, tgt_img)
-                reward = self.empty_penalty * 0.5
+                reward = self.cfg.empty_penalty * 0.5
                 terminated = True
 
-            else:
-                base_reward = 0.0
-                eps = 1e-6
-                c = 1.0
+        else:
+            base_reward = 0.0
+            eps = 1e-6
+            c = 1.0
 
-                if self.reward_mode == "improvement":
-                    base_reward = delta_mse
+            if self.cfg.reward_mode == "improvement":
+                base_reward = delta_mse
 
-                elif self.reward_mode == "neg_mse":
-                    base_reward = -mse
+            elif self.cfg.reward_mode == "neg_mse":
+                base_reward = -mse
 
-                elif self.reward_mode == "improvement_ratio":
-                    if (self.last_mse is not None) and np.isfinite(self.last_mse) and (self.last_mse > eps) and np.isfinite(mse):
-                        base_reward = (self.last_mse - mse) / max(self.last_mse, eps)
-                    else:
-                        base_reward = 0.0
-
-                elif self.reward_mode == "improvement_log":
-                    if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
-                        base_reward = float(np.log(self.last_mse + c) - np.log(mse + c))
-                    else:
-                        base_reward = 0.0
-
-                elif self.reward_mode == "progress_log_to_thresh":
-                    th = max(self.success_threshold, eps)
-                    if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
-                        prev_term = float(np.log(max(self.last_mse, th)))
-                        curr_term = float(np.log(max(mse, th)))
-                        base_reward = prev_term - curr_term
-                    else:
-                        base_reward = 0.0
-
-                elif self.reward_mode == "log_progress_with_threshold":
-                    th = max(self.success_threshold, eps)
-                    if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
-                        log_improve = float(np.log(self.last_mse + c) - np.log(mse + c))
-                        prev_term = float(np.log(max(self.last_mse, th)))
-                        curr_term = float(np.log(max(mse, th)))
-                        toward_thresh = max(prev_term - curr_term, 0.0)
-                    else:
-                        log_improve = 0.0
-                        toward_thresh = 0.0
-                    base_reward = log_improve + self.threshold_focus_coef * toward_thresh
-
-                elif self.reward_mode == "curr_first_positive":
-                    prev = self.last_mse if (self.last_mse is not None and np.isfinite(self.last_mse)) else mse
-                    base_reward = self._reward_curr_first_positive_symmetric(
-                        prev_mse=prev,
-                        curr_mse=mse,
-                        m_ref=self.success_threshold,
-                        alpha=self.curr_first_alpha,
-                    )
-
-                elif self.reward_mode == "curr_delta":
-                    if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
-                        base_reward = (self.last_mse - mse) / max(self.last_mse, eps)
-                    else:
-                        base_reward = 0.0
-
-                elif self.reward_mode == "simple_step_with_final_bonus":
-                    if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
-                        if mse < self.last_mse:
-                            base_reward = 1.0
-                        elif mse > self.last_mse:
-                            base_reward = -1.0
-                        else:
-                            base_reward = 0.0
-                    else:
-                        base_reward = 0.0
-
+            elif self.cfg.reward_mode == "improvement_ratio":
+                if (self.last_mse is not None) and np.isfinite(self.last_mse) and (self.last_mse > eps) and np.isfinite(mse):
+                    base_reward = (self.last_mse - mse) / max(self.last_mse, eps)
                 else:
-                    raise ValueError(f"Unknown reward_mode: {self.reward_mode}")
+                    base_reward = 0.0
 
-                reward = self.reward_scale * float(base_reward)
+            elif self.cfg.reward_mode == "improvement_log":
+                if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
+                    base_reward = float(np.log(self.last_mse + c) - np.log(mse + c))
+                else:
+                    base_reward = 0.0
 
-                mse_bonus = 0.0
-                if np.isfinite(mse) and mse <= self.mse_small_bonus_threshold:
-                    reward += self.mse_small_bonus
-                    mse_bonus = self.mse_small_bonus
+            elif self.cfg.reward_mode == "progress_log_to_thresh":
+                th = max(self.cfg.success_threshold, eps)
+                if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
+                    prev_term = float(np.log(max(self.last_mse, th)))
+                    curr_term = float(np.log(max(mse, th)))
+                    base_reward = prev_term - curr_term
+                else:
+                    base_reward = 0.0
 
-                reached = (mse < self.success_threshold)
-                crossed = reached and ((self.last_mse is None) or (self.last_mse >= self.success_threshold))
-                if reached:
-                    reward += self.success_bonus
-                    if crossed:
-                        reward += self.success_crossing_bonus
-                    terminated = True
+            elif self.cfg.reward_mode == "log_progress_with_threshold":
+                th = max(self.cfg.success_threshold, eps)
+                if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
+                    log_improve = float(np.log(self.last_mse + c) - np.log(mse + c))
+                    prev_term = float(np.log(max(self.last_mse, th)))
+                    curr_term = float(np.log(max(mse, th)))
+                    toward_thresh = max(prev_term - curr_term, 0.0)
+                else:
+                    log_improve = 0.0
+                    toward_thresh = 0.0
+                base_reward = log_improve + self.cfg.threshold_focus_coef * toward_thresh
 
-                # 终局大奖励（在 terminated 设置之后）
-                if (terminated or truncated) and self.reward_mode == "simple_step_with_final_bonus":
-                    if (self.initial_mse is not None) and np.isfinite(self.initial_mse) and np.isfinite(mse):
-                        improvement_ratio = (self.initial_mse - mse) / max(self.initial_mse, eps)
-                        if improvement_ratio > 0:
-                            final_bonus = self.final_bonus_scale * improvement_ratio
-                            reward += final_bonus
-                            
-                            if mse < self.success_threshold:
-                                reward += 0.0
+            elif self.cfg.reward_mode == "curr_first_positive":
+                prev = self.last_mse if (self.last_mse is not None and np.isfinite(self.last_mse)) else mse
+                base_reward = self._reward_curr_first_positive_symmetric(
+                    prev_mse=prev,
+                    curr_mse=mse,
+                    m_ref=self.cfg.success_threshold,
+                    alpha=self.cfg.curr_first_alpha,
+                )
 
-                if self.clip_reward is not None:
-                    reward = float(np.clip(reward, self.clip_reward[0], self.clip_reward[1]))
+            elif self.cfg.reward_mode == "curr_delta":
+                if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
+                    base_reward = (self.last_mse - mse) / max(self.last_mse, eps)
+                else:
+                    base_reward = 0.0
 
-                self.last_mse = mse
-                if self.best_mse is None or mse < self.best_mse:
-                    self.best_mse = mse
+            elif self.cfg.reward_mode == "simple_step_with_final_bonus":
+                if (self.last_mse is not None) and np.isfinite(self.last_mse) and np.isfinite(mse):
+                    if mse < self.last_mse:
+                        base_reward = 1.0
+                    elif mse > self.last_mse:
+                        base_reward = -1.0
+                    else:
+                        base_reward = 0.0
+                else:
+                    base_reward = 0.0
+
+            else:
+                raise ValueError(f"Unknown reward_mode: {self.cfg.reward_mode}")
+
+            reward = self.cfg.reward_scale * float(base_reward)
+
+            mse_bonus = 0.0
+            if np.isfinite(mse) and mse <= self.cfg.mse_small_bonus_threshold:
+                reward += self.cfg.mse_small_bonus
+                mse_bonus = self.cfg.mse_small_bonus
+
+            reached = (mse < self.cfg.success_threshold)
+            crossed = reached and ((self.last_mse is None) or (self.last_mse >= self.cfg.success_threshold))
+            if reached:
+                reward += self.cfg.success_bonus
+                if crossed:
+                    reward += self.cfg.success_crossing_bonus
+                terminated = True
+
+            # Final bonus (after terminated is set)
+            if (terminated or truncated) and self.cfg.reward_mode == "simple_step_with_final_bonus":
+                if (self.initial_mse is not None) and np.isfinite(self.initial_mse) and np.isfinite(mse):
+                    improvement_ratio = (self.initial_mse - mse) / max(self.initial_mse, eps)
+                    if improvement_ratio > 0:
+                        final_bonus = self.cfg.final_bonus_scale * improvement_ratio
+                        reward += final_bonus
+                        
+                        if mse < self.cfg.success_threshold:
+                            reward += 0.0
+
+            if self.cfg.clip_reward is not None:
+                reward = float(np.clip(reward, self.cfg.clip_reward[0], self.cfg.clip_reward[1]))
+
+            self.last_mse = mse
+            if self.best_mse is None or mse < self.best_mse:
+                self.best_mse = mse
 
         obs = (curr_img.float().clamp(0, 1), tgt_img.float().clamp(0, 1))
         self.score += float(reward)
 
-        if is_empty and self.handle_empty in ("terminate", "rollback"):
+        if is_empty and self.cfg.handle_empty in ("terminate", "rollback"):
             terminated_reason = "empty_image"
         elif (self.bad_streak_limit > 0) and (self.bad_streak >= self.bad_streak_limit):
             terminated_reason = "rollback"
-        elif (not is_empty) and (mse < self.success_threshold):
+        elif (not is_empty) and (mse < self.cfg.success_threshold):
             terminated_reason = "success"
         elif truncated:
             terminated_reason = "max_steps"
@@ -1021,7 +783,7 @@ class SE3PoseEnvDiscrete(gym.Env):
             "best_mse": self.best_mse,
             "delta_mse": delta_mse,
             "step": self.step_count,
-            "success": bool(not is_empty and np.isfinite(mse) and mse < self.success_threshold),
+            "success": bool(not is_empty and np.isfinite(mse) and mse < self.cfg.success_threshold),
             "score": self.score,
             "is_empty": is_empty,
             "terminated_reason": terminated_reason,
@@ -1047,6 +809,67 @@ class SE3PoseEnvDiscrete(gym.Env):
         })
 
         return obs, float(reward), terminated, truncated, info
+
+    def _action_to_delta(self, action_id: int) -> torch.Tensor:
+        delta = torch.eye(4, device=self.extrinsic.device, dtype=torch.float32)
+        
+        if action_id == 0:    # tx+
+            delta[0, 3] = self.cfg.trans_step
+        elif action_id == 1:  # tx-
+            delta[0, 3] = -self.cfg.trans_step
+        elif action_id == 2:  # ty+
+            delta[1, 3] = self.cfg.trans_step
+        elif action_id == 3:  # ty-
+            delta[1, 3] = -self.cfg.trans_step
+        elif action_id == 4:  # tz+
+            delta[2, 3] = self.cfg.trans_step
+        elif action_id == 5:  # tz-
+            delta[2, 3] = -self.cfg.trans_step
+        elif action_id == 6:  # rx+
+            angle = np.deg2rad(self.cfg.rot_step_deg)
+            delta[:3, :3] = torch.tensor([
+                [1, 0, 0],
+                [0, np.cos(angle), -np.sin(angle)],
+                [0, np.sin(angle), np.cos(angle)]
+            ], device=delta.device, dtype=torch.float32)
+        elif action_id == 7:  # rx-
+            angle = np.deg2rad(-self.cfg.rot_step_deg)
+            delta[:3, :3] = torch.tensor([
+                [1, 0, 0],
+                [0, np.cos(angle), -np.sin(angle)],
+                [0, np.sin(angle), np.cos(angle)]
+            ], device=delta.device, dtype=torch.float32)
+        elif action_id == 8:  # ry+
+            angle = np.deg2rad(self.cfg.rot_step_deg)
+            delta[:3, :3] = torch.tensor([
+                [np.cos(angle), 0, np.sin(angle)],
+                [0, 1, 0],
+                [-np.sin(angle), 0, np.cos(angle)]
+            ], device=delta.device, dtype=torch.float32)
+        elif action_id == 9:  # ry-
+            angle = np.deg2rad(-self.cfg.rot_step_deg)
+            delta[:3, :3] = torch.tensor([
+                [np.cos(angle), 0, np.sin(angle)],
+                [0, 1, 0],
+                [-np.sin(angle), 0, np.cos(angle)]
+            ], device=delta.device, dtype=torch.float32)
+        elif action_id == 10:  # rz+
+            angle = np.deg2rad(self.cfg.rot_step_deg)
+            delta[:3, :3] = torch.tensor([
+                [np.cos(angle), -np.sin(angle), 0],
+                [np.sin(angle), np.cos(angle), 0],
+                [0, 0, 1]
+            ], device=delta.device, dtype=torch.float32)
+        elif action_id == 11:  # rz-
+            angle = np.deg2rad(-self.cfg.rot_step_deg)
+            delta[:3, :3] = torch.tensor([
+                [np.cos(angle), -np.sin(angle), 0],
+                [np.sin(angle), np.cos(angle), 0],
+                [0, 0, 1]
+            ], device=delta.device, dtype=torch.float32)
+        
+        return delta
+
 
 # =============================
 # Utilities for data/params
@@ -1074,7 +897,6 @@ def get_default_surfaces():
         "right_ridge":  {"file": "./data/right_ridge.vtk",  "color": [0.6, 0.6, 0.9], "opacity": 1.0},
         "bottom_liver": {"file": "./data/bottom_liver_new.vtk", "color": [0.8, 0.8, 0.8], "opacity": 1.0},
     }
-
 
 
 def get_default_camera_params():
