@@ -799,7 +799,7 @@ def train():
     )
     # Optional: resume from checkpoint
     # resume_path = "./checkpoints/refinenet_ppo_1000.pt"
-    resume_path = "checkpoints/refinenet_ppo_500.pt"
+    resume_path = "refinenet_ppo_500.pt"
     if os.path.exists(resume_path):
         try:
             sd = torch.load(resume_path, map_location=device)
@@ -1017,4 +1017,5 @@ def train():
 
 
 if __name__ == "__main__":
+
     train()
