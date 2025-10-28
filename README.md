@@ -19,6 +19,8 @@ We take **patient 4** as an example to demonstrate the training and registration
 - **`refinenetppo_auto.py`**  
   This is the **training script** for the reinforcement learning–based registration model.
 
+- **`env_auto.py`**  
+  This is the **environment script** for the reinforcement learning–based registration model.
 ---
 
 ## 🧠 Method Overview
