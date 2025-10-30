@@ -40,8 +40,8 @@ import kornia.morphology as morph
 # =========================
 class VTKRenderer:
     """
-    合并 VTK 网格 → PyTorch3D Meshes
-    仅在需要时进行 RGB 着色渲染；平时只用一次 rasterizer 得到 fragments / depth / pix_to_face。
+    Merge VTK meshes → PyTorch3D Meshes
+    Only perform RGB shading rendering when needed; normally just use rasterizer once to get fragments / depth / pix_to_face.
     """
     def __init__(
         self,
@@ -61,7 +61,7 @@ class VTKRenderer:
         self.surfaces = surfaces
         self.use_shading = use_shading
 
-        # 原始（全尺寸）内参
+        # Original (full-size) intrinsics
         self.W_full = float(camera_params["W"])
         self.H_full = float(camera_params["H"])
         self.fx_full = float(camera_params["fx"])
@@ -69,11 +69,11 @@ class VTKRenderer:
         self.cx_full = float(camera_params["cx"])
         self.cy_full = float(camera_params["cy"])
 
-        # 目标渲染分辨率
+        # Target rendering resolution
         self.out_W = int(out_size)
         self.out_H = int(out_size)
 
-        # 栅格化参数
+        # Rasterization parameters
         self.faces_per_pixel = int(faces_per_pixel)
         self.blur_radius = float(blur_radius)
         self.zfar = float(zfar)
@@ -81,7 +81,7 @@ class VTKRenderer:
         self._init_camera_and_rasterizer(extrinsic_matrix)
         self._load_meshes()
 
-        # 缓存
+        # Cache
         self._rendered = False
         self._fragments = None
         self._depth_buffer = None
@@ -98,7 +98,7 @@ class VTKRenderer:
         R = extrinsic[:3, :3].unsqueeze(0)
         T = extrinsic[:3, 3].unsqueeze(0)
 
-        # 缩放内参加到 out_size
+        # Scale intrinsics to out_size
         scale_x = self.out_W / self.W_full
         scale_y = self.out_H / self.H_full
         fx_small = self.fx_full * scale_x
@@ -113,11 +113,6 @@ class VTKRenderer:
             R=R, T=T, in_ndc=False, device=self.device
         )
 
-        # self.raster_settings = RasterizationSettings(
-        #     image_size=(self.out_H, self.out_W),
-        #     blur_radius=self.blur_radius,
-        #     faces_per_pixel=self.faces_per_pixel
-        # )
         self.raster_settings = RasterizationSettings(
             image_size=(self.out_H, self.out_W),
             blur_radius=self.blur_radius,
@@ -231,7 +226,7 @@ class VTKRenderer:
 
     def render_rgb(self):
         if not self.use_shading:
-            raise RuntimeError("use_shading=False 时未构造 RGB 渲染器。")
+            raise RuntimeError("RGB renderer not constructed when use_shading=False.")
         if self._rgb_image is None:
             self._ensure_rasterized()
             img = self.rgb_renderer(self.merged_mesh)  # (1,H,W,3)
@@ -269,37 +264,36 @@ class VTKRenderer:
         if component_name is None:
             return {n: m.clone() for n, m in self._masks.items()}
         if component_name not in self._masks:
-            raise ValueError(f"Component '{component_name}' 不存在，可选：{list(self._masks.keys())}")
+            raise ValueError(f"Component '{component_name}' does not exist, available: {list(self._masks.keys())}")
         return self._masks[component_name].clone()
 
     def update_camera_matrix(self, new_extrinsic_matrix: Union[torch.Tensor, np.ndarray]):
         """
-        更新相机外参矩阵（自动检查并修正旋转部分为正交矩阵）
+        Update camera extrinsic matrix (automatically check and correct rotation part to be orthogonal)
         """
-        # 转换为 tensor
+        # Convert to tensor
         if isinstance(new_extrinsic_matrix, np.ndarray):
             extrinsic = torch.from_numpy(new_extrinsic_matrix).float().to(self.device)
         else:
             extrinsic = new_extrinsic_matrix.float().to(self.device)
     
         # ==============
-        # 自动正交化 R
+        # Auto-orthogonalize R
         # ==============
         R_new = extrinsic[:3, :3]
         T_new = extrinsic[:3, 3]
     
-        # 检查是否正交
+        # Check if orthogonal
         with torch.no_grad():
             I = torch.eye(3, device=R_new.device, dtype=R_new.dtype)
             det_R = torch.det(R_new).item()
             orth_err = torch.norm(R_new.T @ R_new - I).item()
     
             if (abs(det_R - 1.0) > 1e-3) or (orth_err > 1e-3):
-                # print(f"⚠️ [VTKRenderer] Non-orthogonal rotation detected (det={det_R:.4f}, err={orth_err:.4e}), auto-fixing...")
-                # 用 SVD 修正
+                # Fix using SVD
                 U, _, Vt = torch.linalg.svd(R_new)
                 R_new = U @ Vt
-                # 保证 det(R)=+1
+                # Ensure det(R)=+1
                 if torch.det(R_new) < 0:
                     U[:, -1] *= -1
                     R_new = U @ Vt
@@ -307,14 +301,14 @@ class VTKRenderer:
         R_new = R_new.unsqueeze(0)
         T_new = T_new.unsqueeze(0)
     
-        # 更新到相机
+        # Update camera
         self.cameras.R = R_new
         self.cameras.T = T_new
         self.rasterizer.cameras = self.cameras
         if self.shader is not None:
             self.shader.cameras = self.cameras
     
-        # 重置缓存
+        # Reset cache
         self._rendered = False
         self._fragments = None
         self._depth_buffer = None
@@ -377,8 +371,8 @@ def re_rendering(
     out_size: int = 128,
 ) -> torch.Tensor:
     """
-    返回 (6, H, W)，通道：
-      [ B(韧带), G(右脊), R(左脊), Edge, invDepth(归一化), liverMask ]
+    Returns (6, H, W), channels:
+      [ B(ligament), G(right_ridge), R(left_ridge), Edge, invDepth(normalized), liverMask ]
     """
     device = torch.device(device)
     renderer.update_camera_matrix(matrix)
@@ -475,19 +469,19 @@ class DiscreteStepSizes:
 # =============================
 class SE3PoseEnvDiscrete(gym.Env):
     """
-    观测：Tuple( current_6ch, target_6ch )
-    奖励（支持多种模式）：
-      - "improvement": mse 的绝对改善
-      - "neg_mse": 直接用 -mse
-      - "improvement_ratio": 相对改善 (Δ/mse_prev)
-      - "improvement_log": 对数改善 log(mse_prev+c)-log(mse+c)
-      - "progress_log_to_thresh": 以阈值为参考的对数进度
-      - "log_progress_with_threshold": 对数改善 + 逼近阈值强化 + 首次跨阈值额外奖励
-      - "curr_first_positive": 以当前误差为主、改进为辅（严格对称负惩罚）
-      - "curr_delta": 允许负数惩罚；按本步 MSE 变化的归一化增量
-      - "simple_step_with_final_bonus": 每步 ±1，终局按总体改进比例给大奖励
+    Observation: Tuple( current_6ch, target_6ch )
+    Reward (supports multiple modes):
+      - "improvement": absolute improvement in MSE
+      - "neg_mse": directly use -mse
+      - "improvement_ratio": relative improvement (Δ/mse_prev)
+      - "improvement_log": logarithmic improvement log(mse_prev+c)-log(mse+c)
+      - "progress_log_to_thresh": logarithmic progress with threshold reference
+      - "log_progress_with_threshold": log improvement + threshold approach reinforcement + first-time crossing bonus
+      - "curr_first_positive": focus on current error with improvement as supplement (strictly symmetric negative penalty)
+      - "curr_delta": allow negative penalty; normalized increment based on current step MSE change
+      - "simple_step_with_final_bonus": ±1 per step, final bonus based on overall improvement ratio
 
-    优化：target 图像在 episode 内只渲染一次并缓存
+    Optimization: target image is rendered only once per episode and cached
     """
     metadata = {"render_modes": []}
 
@@ -540,7 +534,7 @@ class SE3PoseEnvDiscrete(gym.Env):
         fine_rot_deg: float = 2.0,
         fine_threshold: float = 100.0,
 
-        # ---- NEW: target 的二值 mask 相关参数 ----
+        # ---- NEW: target binary mask related parameters ----
         target_mask_path: Optional[str] = None,
         target_mask_threshold: float = 0.5,
         target_mask_invert: bool = False,
@@ -611,7 +605,7 @@ class SE3PoseEnvDiscrete(gym.Env):
         self.best_mse: Optional[float] = None
         self.initial_mse: Optional[float] = None
 
-        # Target 图像缓存（优化性能）
+        # Target image cache (performance optimization)
         self.target_img_cached: Optional[Tensor] = None
         self.target_extrinsic_last: Optional[Tensor] = None
 
@@ -619,7 +613,7 @@ class SE3PoseEnvDiscrete(gym.Env):
             if self.start_extrinsic is None or self.target_extrinsic is None:
                 raise ValueError("When `dataset` is None, you must provide both `start_extrinsic` and `target_extrinsic`.")
 
-        # ---- NEW: 读取并缓存 target 的二值 mask ----
+        # ---- NEW: load and cache target binary mask ----
         self.target_mask: Optional[Tensor] = None
         self.target_mask_path = target_mask_path
         self.target_mask_threshold = float(target_mask_threshold)
@@ -627,7 +621,7 @@ class SE3PoseEnvDiscrete(gym.Env):
 
         if self.target_mask_path is not None:
             mask_path = self.target_mask_path
-            # 小容错：若 "./largest.n=png" 不存在，自动尝试 "./largest.png"
+            # Small fallback: if "./largest.n=png" doesn't exist, automatically try "./largest.png"
             if (not os.path.exists(mask_path)) and (mask_path.endswith(".n=png")):
                 fallback = mask_path.replace(".n=png", ".png")
                 if os.path.exists(fallback):
@@ -635,11 +629,10 @@ class SE3PoseEnvDiscrete(gym.Env):
 
             if os.path.exists(mask_path):
                 try:
-                    # 读为灰度并重采样到 out_size
+                    # Read as grayscale and resample to out_size
                     img = Image.open(mask_path).convert("L")
                     img = img.resize((self.out_size, self.out_size), resample=Image.NEAREST)
                     mask_np = np.array(img, dtype=np.float32)
-                    # print(np.unique(mask_np))
                     mask_np = (mask_np >= self.target_mask_threshold).astype(np.float32)
                     if self.target_mask_invert:
                         mask_np = 1.0 - mask_np
@@ -704,18 +697,18 @@ class SE3PoseEnvDiscrete(gym.Env):
         else:
             temp_ex = pytorch3d_to_surgvtk(self.extrinsic)
             self.extrinsic = vtk_2_PyTorch3D(surgvtk_2_vtk(temp_ex @ delta_T))
-            # print(self.extrinsic)
+
     def _render_obs(self) -> Tuple[Tensor, Tensor]:
         """
-        只渲染当前图像，target 使用缓存
-        在同一个 episode 内，target 只渲染一次
+        Only render current image, target uses cache
+        Within the same episode, target is rendered only once
         """
-        # 始终渲染当前图像
+        # Always render current image
         current_img = re_rendering(self.extrinsic, self.renderer, device=self.device, out_size=self.out_size)
     
-        # === NEW: 对 current 同样应用 target 的二值 mask（与 reset 中对 target 的做法一致） ===
+        # === NEW: apply the same binary mask to current as done for target in reset ===
         if self.target_mask is not None:
-            # 尺寸保险：必要时把 mask resize 到与 current 对齐
+            # Safety: resize mask if necessary to align with current
             if self.target_mask.shape[-2:] != current_img.shape[-2:]:
                 resized_mask = F.interpolate(
                     self.target_mask.unsqueeze(0),  # (1,1,H,W)
@@ -725,10 +718,10 @@ class SE3PoseEnvDiscrete(gym.Env):
             else:
                 resized_mask = self.target_mask  # (1,H,W)
     
-            # (6,H,W) * (1,H,W) 广播
+            # (6,H,W) * (1,H,W) broadcast
             current_img = current_img * resized_mask
     
-        # 检查是否需要重新渲染 target
+        # Check if need to re-render target
         need_render_target = (
             self.target_img_cached is None or
             self.target_extrinsic_last is None or
@@ -736,10 +729,10 @@ class SE3PoseEnvDiscrete(gym.Env):
         )
     
         if need_render_target:
-            # 这里渲染出来的是“未增强/未掩膜”的 target；真正用于输出/训练的 masked 版本
-            # 会在 reset() 中完成并缓存到 self.target_img_cached
+            # The rendered output here is "un-augmented/un-masked" target; the actual masked version
+            # for output/training will be completed and cached in reset() to self.target_img_cached
             target_img = re_rendering(self.target_extrinsic, self.renderer, device=self.device, out_size=self.out_size)
-            self.target_img_cached = target_img.clone()  # 立即缓存，reset() 中会覆盖成增强+mask 的版本
+            self.target_img_cached = target_img.clone()  # Cache immediately, will be overwritten in reset() with augmented+masked version
             self.target_extrinsic_last = self.target_extrinsic.clone()
         else:
             target_img = self.target_img_cached
@@ -752,7 +745,7 @@ class SE3PoseEnvDiscrete(gym.Env):
         if self.target_extrinsic is None or self.start_extrinsic is None:
             raise RuntimeError("Both `target_extrinsic` and `start_extrinsic` are required.")
         mat2 = self.target_extrinsic
-        mat2_pred = self.extrinsic  # 当前预测的位姿
+        mat2_pred = self.extrinsic  # Current predicted pose
         pose_error = torch.linalg.inv(pytorch3d_to_surgvtk(mat2)) @ pytorch3d_to_surgvtk(mat2_pred)
         pts = self.model_pts  # (N, 3)
         R = pose_error[:3, :3]
@@ -763,6 +756,7 @@ class SE3PoseEnvDiscrete(gym.Env):
             mse = float("inf")
 
         return float(mse)
+    
     def _is_empty_mask(self, curr6: Tensor, min_frac: float = 1e-4) -> bool:
         area = (curr6[5] > 0.5).float().sum().item()
         H, W = curr6.shape[-2:]
@@ -777,7 +771,7 @@ class SE3PoseEnvDiscrete(gym.Env):
             self._ensure_idpair_index()
             key = (int(forced_mat_ids[0]), int(forced_mat_ids[1]))
             if key not in self._idpair_to_dsindex:
-                raise RuntimeError(f"未在数据集中找到指定的 mat id 组合: {key}")
+                raise RuntimeError(f"Specified mat id combination not found in dataset: {key}")
             idx = self._idpair_to_dsindex[key]
         elif forced_idx is not None:
             idx = int(forced_idx) % len(self.dataset)
@@ -786,11 +780,11 @@ class SE3PoseEnvDiscrete(gym.Env):
                 idx = np.random.randint(len(self.dataset))
             elif self.dataset_mode == "fixed":
                 if self.fixed_mat_ids is None:
-                    raise RuntimeError("dataset_mode='fixed' 需要 fixed_mat_ids=(start_id, target_id)")
+                    raise RuntimeError("dataset_mode='fixed' requires fixed_mat_ids=(start_id, target_id)")
                 self._ensure_idpair_index()
                 key = (int(self.fixed_mat_ids[0]), int(self.fixed_mat_ids[1]))
                 if key not in self._idpair_to_dsindex:
-                    raise RuntimeError(f"未在数据集中找到 fixed_mat_ids: {key}")
+                    raise RuntimeError(f"fixed_mat_ids not found in dataset: {key}")
                 idx = self._idpair_to_dsindex[key]
             else:
                 idx = self.dataset_cursor % len(self.dataset)
@@ -819,14 +813,14 @@ class SE3PoseEnvDiscrete(gym.Env):
             self.start_extrinsic = start_extr
             self.target_extrinsic = target_extr
 
-            # 清空 target 缓存，因为 target_extrinsic 可能改变了
+            # Clear target cache as target_extrinsic may have changed
             self.target_img_cached = None
             self.target_extrinsic_last = None
 
             if forced_idx is not None:
                 expected = int(forced_idx) % len(self.dataset)
                 if sample_idx != expected:
-                    raise RuntimeError(f"索引不匹配! 期望: {expected}, 实际: {sample_idx}")
+                    raise RuntimeError(f"Index mismatch! Expected: {expected}, Actual: {sample_idx}")
 
         elif self.start_extrinsic is None or self.target_extrinsic is None:
             raise RuntimeError("No dataset and no manual start/target provided.")
@@ -836,28 +830,28 @@ class SE3PoseEnvDiscrete(gym.Env):
         self.step_count = 0
         self.score = 0.0
 
-        # 渲染初始观测（这里会缓存未增强的 target）
+        # Render initial observation (this will cache un-augmented target)
         curr_img, tgt_img = self._render_obs()
 
-        # ========= 修改：应用增强 =========
+        # ========= Modified: apply augmentation =========
         if hasattr(self, 'augment_target_on_reset') and self.augment_target_on_reset:
             if hasattr(self, 'target_augmenter') and self.target_augmenter is not None:
                 tgt_img = self.target_augmenter.augment_target(tgt_img)
 
-        # ========= NEW：增强后与二值 mask 相乘 =========
+        # ========= NEW: multiply with binary mask after augmentation =========
         # tgt_img: (6,H,W) in [0,1]
         if self.target_mask is not None:
-            # 保证尺寸匹配（一般 init 已 resize，这里再保险一次）
+            # Ensure size match (usually already resized in init, but safety check)
             if self.target_mask.shape[-2:] != tgt_img.shape[-2:]:
                 self.target_mask = F.interpolate(
                     self.target_mask.unsqueeze(0),  # (1,1,H,W)
                     size=tgt_img.shape[-2:],
                     mode="nearest"
                 ).squeeze(0)
-            # mask (1,H,W) 广播到 (6,H,W)
+            # mask (1,H,W) broadcast to (6,H,W)
             tgt_img = tgt_img * self.target_mask
 
-        # 更新缓存为“最终版”的 target（增强+mask）
+        # Update cache to "final version" of target (augmented+masked)
         self.target_img_cached = tgt_img.clone()
 
         self.curr_img = (curr_img, tgt_img)
@@ -930,15 +924,15 @@ class SE3PoseEnvDiscrete(gym.Env):
              terminate_confidence: float = 0.7):
         """
         Args:
-            action_id: 动作ID
-            predicted_step_mode: 模型预测的步长模式 (0-1之间, >0.5表示fine mode)
-            predicted_terminate: 模型预测的终止概率 (0-1之间)
-            terminate_confidence: 终止决策的置信度阈值
+            action_id: action ID
+            predicted_step_mode: model predicted step size mode (0-1, >0.5 indicates fine mode)
+            predicted_terminate: model predicted termination probability (0-1)
+            terminate_confidence: confidence threshold for termination decision
         """
         self.step_count += 1
         self.prev_extrinsic = self.extrinsic.clone()
 
-        # ========= 使用模型预测决定步长模式 =========
+        # ========= Use model prediction to decide step size mode =========
         if predicted_step_mode is not None:
             use_fine = (predicted_step_mode > 0.5)
             if use_fine:
@@ -951,7 +945,7 @@ class SE3PoseEnvDiscrete(gym.Env):
                 step_mode = "coarse"
             gt_step_mode = 1.0 if use_fine else 0.0
         elif self.adaptive_step and (self.last_mse is not None) and np.isfinite(self.last_mse):
-            # 后备方案: 使用原来的硬编码逻辑
+            # Fallback: use original hardcoded logic
             step_mode = "fine" if self.last_mse < self.fine_threshold else "coarse"
             gt_step_mode = 1.0 if self.last_mse < self.fine_threshold * 2 else 0.0
             if step_mode == "fine":
@@ -966,7 +960,7 @@ class SE3PoseEnvDiscrete(gym.Env):
             step_mode = "default"
             gt_step_mode = 0.0
 
-        # 构建动作向量
+        # Construct action vector
         xi = torch.zeros(6, dtype=torch.float32, device=self.device)
         if   action_id == 0:  xi[0] = +s_t
         elif action_id == 1:  xi[0] = -s_t
@@ -986,7 +980,7 @@ class SE3PoseEnvDiscrete(gym.Env):
         delta = se3_exp(xi)
         self._apply_delta(delta)
 
-        # 渲染观测（target 使用缓存，只渲染 current）
+        # Render observation (target uses cache, only render current)
         curr_img, tgt_img = self._render_obs()
         self.curr_img = (curr_img, tgt_img)
 
@@ -1030,7 +1024,7 @@ class SE3PoseEnvDiscrete(gym.Env):
             mse = self._compute_mse()
             delta_mse = (self.last_mse - mse) if (self.last_mse is not None and np.isfinite(self.last_mse)) else 0.0
 
-            # ========= 生成ground truth终止标签 =========
+            # ========= Generate ground truth termination label =========
             should_terminate = False
             if mse < self.success_threshold:
                 should_terminate = True
@@ -1161,7 +1155,7 @@ class SE3PoseEnvDiscrete(gym.Env):
                 if self.best_mse is None or mse < self.best_mse:
                     self.best_mse = mse
 
-        # ========= 使用模型预测决定是否终止 =========
+        # ========= Use model prediction to decide whether to terminate =========
         model_wants_terminate = (
             predicted_terminate is not None and
             predicted_terminate > terminate_confidence
@@ -1175,7 +1169,7 @@ class SE3PoseEnvDiscrete(gym.Env):
         elif (self.bad_streak_limit > 0) and (self.bad_streak >= self.bad_streak_limit):
             terminated_reason = "rollback"
         elif model_wants_terminate and not terminated:
-            # 模型决定终止
+            # Model decides to terminate
             terminated = True
             terminated_reason = "model_decision"
         elif (not is_empty) and (mse < self.success_threshold):
@@ -1262,6 +1256,4 @@ def get_default_camera_params():
         'W': 1920, 'H': 1080,
         'fx': 1279.8129504, 'fy': 1279.8129504,
         'cx': 955.172960, 'cy': 499.166189
-
     }
-
